@@ -524,7 +524,7 @@ accesskit_unix = "0.22"
 accesskit_windows = "0.34"
 agent-client-protocol = { version = "=2.2.0", features = ["unstable", "unstable_protocol_v2"] }
 aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "03807d9fa24e13a23775558ff9762ab331d76bc5" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 arc-swap = "1.9.0"

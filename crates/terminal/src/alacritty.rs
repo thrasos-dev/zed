@@ -224,6 +224,10 @@ pub(super) fn display_offset(term: &AlacrittyTerm) -> usize {
     term.grid().display_offset()
 }
 
+pub(super) fn modes(term: &AlacrittyTerm) -> Modes {
+    terminal_modes_from_alacritty(*term.mode())
+}
+
 pub(super) fn scroll_display(term: &mut AlacrittyTerm, scroll: Scroll) {
     term.scroll_display(scroll.to_alacritty());
 }
@@ -605,6 +609,12 @@ impl Modes {
         add_alacritty_mode(&mut mode, self, Self::MOUSE_DRAG, TermMode::MOUSE_DRAG);
         add_alacritty_mode(&mut mode, self, Self::MOUSE_MOTION, TermMode::MOUSE_MOTION);
         add_alacritty_mode(&mut mode, self, Self::VI, TermMode::VI);
+        add_alacritty_mode(
+            &mut mode,
+            self,
+            Self::COLOR_SCHEME_UPDATES,
+            TermMode::COLOR_SCHEME_UPDATES,
+        );
         mode
     }
 }
@@ -698,6 +708,12 @@ fn terminal_modes_from_alacritty(mode: TermMode) -> Modes {
         Modes::MOUSE_MOTION,
     );
     add_terminal_mode(&mut terminal_modes, mode, TermMode::VI, Modes::VI);
+    add_terminal_mode(
+        &mut terminal_modes,
+        mode,
+        TermMode::COLOR_SCHEME_UPDATES,
+        Modes::COLOR_SCHEME_UPDATES,
+    );
     terminal_modes
 }
 
@@ -1140,7 +1156,8 @@ mod tests {
             | TermMode::ALT_SCREEN
             | TermMode::MOUSE_DRAG
             | TermMode::SGR_MOUSE
-            | TermMode::VI;
+            | TermMode::VI
+            | TermMode::COLOR_SCHEME_UPDATES;
 
         let terminal_modes = terminal_modes_from_alacritty(alacritty_modes);
         assert!(terminal_modes.contains(Modes::APP_CURSOR));
@@ -1150,6 +1167,7 @@ mod tests {
         assert!(terminal_modes.intersects(Modes::MOUSE_MODE));
         assert!(terminal_modes.contains(Modes::SGR_MOUSE));
         assert!(terminal_modes.contains(Modes::VI));
+        assert!(terminal_modes.contains(Modes::COLOR_SCHEME_UPDATES));
         assert!(!terminal_modes.contains(Modes::MOUSE_REPORT_CLICK));
 
         let alacritty_modes = terminal_modes.to_alacritty();
@@ -1159,6 +1177,7 @@ mod tests {
         assert!(alacritty_modes.contains(TermMode::MOUSE_DRAG));
         assert!(alacritty_modes.contains(TermMode::SGR_MOUSE));
         assert!(alacritty_modes.contains(TermMode::VI));
+        assert!(alacritty_modes.contains(TermMode::COLOR_SCHEME_UPDATES));
         assert!(!alacritty_modes.contains(TermMode::MOUSE_REPORT_CLICK));
     }
 

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
-use theme::{ActiveTheme, Theme};
+use theme::{ActiveTheme, Appearance, GlobalTheme, Theme};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
@@ -66,7 +66,7 @@ use crate::alacritty::{
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
     display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
+    make_content, modes, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
     scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
     toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
@@ -373,6 +373,7 @@ impl Modes {
     pub const MOUSE_DRAG: Self = Self(1 << 14);
     pub const MOUSE_MOTION: Self = Self(1 << 15);
     pub const VI: Self = Self(1 << 16);
+    pub const COLOR_SCHEME_UPDATES: Self = Self(1 << 17);
     pub const MOUSE_MODE: Self =
         Self(Self::MOUSE_REPORT_CLICK.0 | Self::MOUSE_DRAG.0 | Self::MOUSE_MOTION.0);
 
@@ -1065,6 +1066,7 @@ impl TerminalBuilder {
             init_command_startup_marker: None,
             init_command_startup_tx: None,
             event_loop_task: Task::ready(Ok(())),
+            last_theme: None,
             background_executor: background_executor.clone(),
             path_style,
             cwd_history: Vec::new(),
@@ -1352,6 +1354,7 @@ impl TerminalBuilder {
                 init_command_startup_marker: None,
                 init_command_startup_tx: None,
                 event_loop_task: Task::ready(Ok(())),
+                last_theme: None,
                 background_executor,
                 path_style,
                 cwd_history: if is_remote_terminal {
@@ -1405,7 +1408,14 @@ impl TerminalBuilder {
         cx.background_spawn(fut)
     }
 
-    pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
+    pub fn subscribe(mut self, cx: &mut Context<Terminal>) -> Terminal {
+        // Some hosts, like many tests, create terminals without loading a theme.
+        if cx.has_global::<GlobalTheme>() {
+            self.terminal.last_theme = Some(cx.theme().clone());
+        }
+        cx.observe_global::<GlobalTheme>(|terminal, cx| terminal.theme_changed(cx.theme().clone()))
+            .detach();
+
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
@@ -1544,6 +1554,8 @@ pub struct Terminal {
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
+    /// Used to tell whether a theme change updated the palette that applications see.
+    last_theme: Option<Arc<Theme>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
@@ -2465,6 +2477,22 @@ impl Terminal {
     pub fn focus_out(&mut self) {
         if self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
             self.write_to_pty("\x1b[O".as_bytes());
+        }
+    }
+
+    fn theme_changed(&mut self, theme: Arc<Theme>) {
+        let Some(previous_theme) = self.last_theme.replace(theme.clone()) else {
+            return;
+        };
+        if !palette_changed(&previous_theme, &theme) {
+            return;
+        }
+
+        // The report arrives as input, so only applications that asked for it via DEC private
+        // mode 2031 can receive it. A shell at its prompt would insert it into the command line.
+        // `last_content` is only refreshed while the terminal is visible, so read the live mode.
+        if modes(&self.term.lock()).contains(Modes::COLOR_SCHEME_UPDATES) {
+            self.write_to_pty(color_scheme_report(theme.appearance));
         }
     }
 
@@ -3499,6 +3527,24 @@ fn content_index_for_mouse(pos: GpuiPoint<Pixels>, terminal_bounds: &TerminalBou
     clamped_row * terminal_bounds.num_columns() + clamped_col
 }
 
+/// Whether applications would see different colors when querying the palette
+/// with OSC 4 (indices 0-255) or OSC 10, 11 and 12 (indices 256-258).
+fn palette_changed(previous_theme: &Theme, theme: &Theme) -> bool {
+    previous_theme.appearance != theme.appearance
+        || (0..=258).any(|index| {
+            get_color_at_index(index, previous_theme) != get_color_at_index(index, theme)
+        })
+}
+
+/// The `CSI ? 997 ; Ps n` color scheme report, where `Ps` is 1 for dark and 2 for light.
+/// See https://contour-terminal.org/vt-extensions/color-palette-update-notifications/
+fn color_scheme_report(color_scheme: Appearance) -> &'static [u8] {
+    match color_scheme {
+        Appearance::Dark => b"\x1b[?997;1n",
+        Appearance::Light => b"\x1b[?997;2n",
+    }
+}
+
 /// Converts an 8 bit ANSI color to its GPUI equivalent.
 /// Accepts `usize` for compatibility with the `alacritty::Colors` interface,
 /// Other than that use case, should only be called with values in the `[0,255]` range
@@ -3665,6 +3711,87 @@ mod tests {
             terminal.write_output(marker.as_bytes(), cx);
         });
         assert!(startup_rx.try_recv().is_ok());
+    }
+
+    #[gpui::test]
+    async fn test_color_scheme_changes_are_reported_to_subscribed_applications(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        set_theme(Appearance::Dark, black(), cx);
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        set_theme(Appearance::Light, gpui::white(), cx);
+        terminal.update(cx, |terminal, _| {
+            assert!(
+                terminal.take_pty_write_log().is_empty(),
+                "applications that did not enable mode 2031 must not receive reports"
+            );
+        });
+
+        terminal.update(cx, |terminal, cx| terminal.write_output(b"\x1b[?2031h", cx));
+        set_theme(Appearance::Light, gpui::white(), cx);
+        terminal.update(cx, |terminal, _| {
+            assert!(
+                terminal.take_pty_write_log().is_empty(),
+                "theme updates that leave the palette untouched must not be reported"
+            );
+        });
+
+        set_theme(Appearance::Dark, black(), cx);
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;1n".to_vec()]
+            );
+        });
+
+        set_theme(Appearance::Dark, gpui::hsla(0., 0., 0.1, 1.), cx);
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;1n".to_vec()]
+            );
+        });
+
+        set_theme(Appearance::Light, gpui::white(), cx);
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[?997;2n".to_vec()]
+            );
+        });
+
+        terminal.update(cx, |terminal, cx| terminal.write_output(b"\x1b[?2031l", cx));
+        set_theme(Appearance::Dark, black(), cx);
+        terminal.update(cx, |terminal, _| {
+            assert!(terminal.take_pty_write_log().is_empty());
+        });
+    }
+
+    fn set_theme(appearance: Appearance, terminal_background: Hsla, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut theme = (**cx.theme()).clone();
+            theme.appearance = appearance;
+            theme.styles.colors.terminal_background = terminal_background;
+            GlobalTheme::update_theme(cx, Arc::new(theme));
+        });
+        cx.run_until_parked();
     }
 
     #[test]
