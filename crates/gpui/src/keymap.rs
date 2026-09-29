@@ -4,8 +4,8 @@ mod context;
 pub use binding::*;
 pub use context::*;
 
-use crate::{Action, AsKeystroke, Keystroke, Unbind, is_no_action, is_unbind};
-use collections::{HashSet, TypeIdHashMap};
+use crate::{Action, AsKeystroke, KeybindingKeystroke, Keystroke, Unbind, is_no_action, is_unbind};
+use collections::{HashMap, HashSet, TypeIdHashMap};
 use smallvec::SmallVec;
 
 /// An opaque identifier of which version of the keymap is currently active.
@@ -167,10 +167,38 @@ impl Keymap {
         input: &[impl AsKeystroke],
         context_stack: &[KeyContext],
     ) -> (SmallVec<[KeyBinding; 1]>, bool) {
+        let (bindings, pending) = self.resolve_bindings_for_input(
+            input,
+            context_stack,
+            self.bindings().enumerate().rev(),
+        );
+        (
+            bindings
+                .into_iter()
+                .map(|(_, binding)| binding.clone())
+                .collect(),
+            pending,
+        )
+    }
+
+    /// Same as `bindings_for_input`, but only looks at `keymap_bindings` instead of the whole
+    /// keymap, and returns each binding with its keymap index.
+    ///
+    /// `keymap_bindings` must be in reverse keymap order and include every binding that could
+    /// match `input`. For example, leaving out a `null` binding would make the binding it disables
+    /// look like it wins. `bindings_for_input` passes the whole keymap, which always meets this but
+    /// goes through every binding on every call. Passing a pre-filtered list is cheaper when
+    /// resolving many inputs against it.
+    fn resolve_bindings_for_input<'a>(
+        &self,
+        input: &[impl AsKeystroke],
+        context_stack: &[KeyContext],
+        keymap_bindings: impl IntoIterator<Item = (usize, &'a KeyBinding)>,
+    ) -> (SmallVec<[(BindingIndex, &'a KeyBinding); 1]>, bool) {
         let mut matched_bindings = SmallVec::<[(usize, BindingIndex, &KeyBinding); 1]>::new();
         let mut pending_bindings = SmallVec::<[(BindingIndex, &KeyBinding); 1]>::new();
 
-        for (ix, binding) in self.bindings().enumerate().rev() {
+        for (ix, binding) in keymap_bindings {
             let Some(depth) = self.binding_enabled(binding, context_stack) else {
                 continue;
             };
@@ -221,7 +249,7 @@ impl Keymap {
                 continue;
             }
 
-            bindings.push(binding.clone());
+            bindings.push((ix, binding));
             first_binding_index.get_or_insert(ix);
         }
 
@@ -251,40 +279,82 @@ impl Keymap {
         }
     }
 
-    /// Find the bindings that can follow the current input sequence.
+    /// Find the bindings that can follow the current input sequence, in precedence order. Only
+    /// includes bindings that typing the rest of their keystrokes would dispatch.
     pub fn possible_next_bindings_for_input(
         &self,
         input: &[Keystroke],
         context_stack: &[KeyContext],
     ) -> Vec<KeyBinding> {
-        let mut bindings = self
+        // Keeps `null` and `Unbind` bindings, which can disable candidates.
+        let bindings_extending_input = self
             .bindings()
             .enumerate()
             .rev()
-            .filter_map(|(ix, binding)| {
-                let depth = self.binding_enabled(binding, context_stack)?;
-                let pending = binding.match_keystrokes(input);
-                match pending {
-                    None => None,
-                    Some(is_pending) => {
-                        if !is_pending
-                            || is_no_action(&*binding.action)
-                            || is_unbind(&*binding.action)
-                        {
-                            return None;
-                        }
-                        Some((depth, BindingIndex(ix), binding))
-                    }
-                }
+            .filter(|(_, binding)| {
+                binding
+                    .match_keystrokes(input)
+                    .is_some_and(|pending| pending)
             })
             .collect::<Vec<_>>();
 
-        bindings.sort_by(|(depth_a, ix_a, _), (depth_b, ix_b, _)| {
+        let mut candidates = bindings_extending_input
+            .iter()
+            .filter(|(_, binding)| !is_no_action(&*binding.action) && !is_unbind(&*binding.action))
+            .filter_map(|&(ix, binding)| {
+                let depth = self.binding_enabled(binding, context_stack)?;
+                Some((depth, ix, binding))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|(depth_a, ix_a, _), (depth_b, ix_b, _)| {
             depth_b.cmp(depth_a).then(ix_b.cmp(ix_a))
         });
 
-        bindings
+        let resolve_remaining = |remaining: &[KeybindingKeystroke]| {
+            // Use the typed input rather than the binding's own keystrokes. A typed keystroke can
+            // match through its physical key, like `alt-s`, or the character it produced, like `ß`.
+            // The remaining keystrokes haven't been typed, so they can only match as written. On a
+            // layout where Option-S types `ß`, a later `"ctrl-k alt-s": null` would disable
+            // `"ctrl-k ß"` when typed, but won't hide it here.
+            let input = input
+                .iter()
+                .chain(remaining.iter().map(AsKeystroke::as_keystroke))
+                .cloned()
+                .collect::<Vec<_>>();
+            let (dispatched, pending) = self.resolve_bindings_for_input(
+                &input,
+                context_stack,
+                bindings_extending_input.iter().copied(),
+            );
+            let dispatched_indices = dispatched
+                .into_iter()
+                .map(|(ix, _)| ix)
+                .collect::<SmallVec<[BindingIndex; 1]>>();
+            (dispatched_indices, pending)
+        };
+
+        let mut resolved_by_remaining = HashMap::default();
+        candidates
             .into_iter()
+            .filter(|&(_, ix, binding)| {
+                let remaining = &binding.keystrokes[input.len()..];
+                // Dispatch only keeps accumulating keystrokes while the input is pending, so
+                // every intermediate prefix must stay pending for the chord to be typeable.
+                let stays_pending = (1..remaining.len()).all(|prefix_len| {
+                    let remaining_prefix = &remaining[..prefix_len];
+                    let (_, pending) = resolved_by_remaining
+                        .entry(remaining_prefix)
+                        .or_insert_with(|| resolve_remaining(remaining_prefix));
+                    *pending
+                });
+
+                stays_pending && {
+                    let (dispatched_indices, _) = resolved_by_remaining
+                        .entry(remaining)
+                        .or_insert_with(|| resolve_remaining(remaining));
+                    dispatched_indices.contains(&BindingIndex(ix))
+                }
+            })
             .map(|(_, _, binding)| binding.clone())
             .collect::<Vec<_>>()
     }
@@ -923,5 +993,240 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result[0].action.partial_eq(&ActionBeta {}));
         assert!(result[1].action.partial_eq(&ActionAlpha {}));
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_null_bindings() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Editor")),
+            KeyBinding::new("ctrl-k b", ActionBeta {}, Some("Editor")),
+            KeyBinding::new("ctrl-k a", NoAction {}, Some("Editor")),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[KeyContext::parse("Editor").unwrap()],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k b".to_string(), "test_only::ActionBeta")]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_unbound_bindings() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Editor")),
+            KeyBinding::new("ctrl-k b", ActionBeta {}, Some("Editor")),
+            KeyBinding::new(
+                "ctrl-k a",
+                Unbind("test_only::ActionAlpha".into()),
+                Some("Editor"),
+            ),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[KeyContext::parse("Editor").unwrap()],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k b".to_string(), "test_only::ActionBeta")]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_keep_user_binding_over_base_keymap_null() {
+        const USER: KeyBindingMetaIndex = KeyBindingMetaIndex(0);
+        const BASE: KeyBindingMetaIndex = KeyBindingMetaIndex(2);
+        const DEFAULT: KeyBindingMetaIndex = KeyBindingMetaIndex(3);
+
+        let mut keymap = Keymap::default();
+        keymap.add_bindings([
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Editor")).with_meta(DEFAULT),
+            KeyBinding::new("ctrl-k a", NoAction {}, Some("Editor")).with_meta(BASE),
+            KeyBinding::new("ctrl-k a", ActionBeta {}, Some("Editor")).with_meta(USER),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[KeyContext::parse("Editor").unwrap()],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k a".to_string(), "test_only::ActionBeta")]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_apply_disabling_by_context() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Workspace")),
+            KeyBinding::new("ctrl-k a", ActionBeta {}, Some("Editor")),
+            KeyBinding::new("ctrl-k b", ActionGamma {}, Some("Editor")),
+            // Only removes the editor binding, so the workspace binding still dispatches.
+            KeyBinding::new(
+                "ctrl-k a",
+                Unbind("test_only::ActionBeta".into()),
+                Some("Editor"),
+            ),
+            // Doesn't apply because `Terminal` isn't in the context stack.
+            KeyBinding::new("ctrl-k b", NoAction {}, Some("Terminal")),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[
+                KeyContext::parse("Workspace").unwrap(),
+                KeyContext::parse("Editor").unwrap(),
+            ],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![
+                ("ctrl-k b".to_string(), "test_only::ActionGamma"),
+                ("ctrl-k a".to_string(), "test_only::ActionAlpha"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_disabled_bindings_with_typed_input() {
+        // Option-S reports both its physical key and the character it produced, so typed input
+        // matches bindings written with either.
+        let typed_input = [Keystroke::parse("alt-s->ß").unwrap()];
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ß a", ActionAlpha {}, None),
+            KeyBinding::new("alt-s a", NoAction {}, None),
+        ]);
+        assert!(
+            keymap
+                .possible_next_bindings_for_input(&typed_input, &[])
+                .is_empty()
+        );
+
+        // Cross-check against dispatch of the same typed input.
+        let typed_then_a = [
+            Keystroke::parse("alt-s->ß").unwrap(),
+            Keystroke::parse("a").unwrap(),
+        ];
+        let (dispatched, _) = keymap.bindings_for_input(&typed_then_a, &[]);
+        assert!(dispatched.is_empty());
+    }
+
+    #[test]
+    fn test_possible_next_bindings_hide_chord_shadowed_by_later_prefix_binding() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a b", ActionAlpha {}, None),
+            KeyBinding::new("ctrl-k a", ActionBeta {}, None),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(&keystrokes("ctrl-k"), &[]);
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k a".to_string(), "test_only::ActionBeta")]
+        );
+        // Dispatch runs `ctrl-k a` instead of waiting for `b`.
+        assert!(!keymap.bindings_for_input(&keystrokes("ctrl-k a"), &[]).1);
+    }
+
+    #[test]
+    fn test_possible_next_bindings_keep_later_longer_chord() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, None),
+            KeyBinding::new("ctrl-k a b", ActionBeta {}, None),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(&keystrokes("ctrl-k"), &[]);
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![
+                ("ctrl-k a b".to_string(), "test_only::ActionBeta"),
+                ("ctrl-k a".to_string(), "test_only::ActionAlpha"),
+            ]
+        );
+        assert!(keymap.bindings_for_input(&keystrokes("ctrl-k a"), &[]).1);
+    }
+
+    #[test]
+    fn test_possible_next_bindings_keep_chord_when_later_sibling_keeps_prefix_pending() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a b", ActionAlpha {}, None),
+            KeyBinding::new("ctrl-k a", ActionBeta {}, None),
+            KeyBinding::new("ctrl-k a c", ActionGamma {}, None),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(&keystrokes("ctrl-k"), &[]);
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![
+                ("ctrl-k a c".to_string(), "test_only::ActionGamma"),
+                ("ctrl-k a".to_string(), "test_only::ActionBeta"),
+                ("ctrl-k a b".to_string(), "test_only::ActionAlpha"),
+            ]
+        );
+        assert!(keymap.bindings_for_input(&keystrokes("ctrl-k a"), &[]).1);
+    }
+
+    #[test]
+    fn test_possible_next_bindings_hide_chord_shadowed_deeper_in_chord() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a b c", ActionAlpha {}, None),
+            KeyBinding::new("ctrl-k a b", ActionBeta {}, None),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(&keystrokes("ctrl-k"), &[]);
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k a b".to_string(), "test_only::ActionBeta")]
+        );
+        assert!(keymap.bindings_for_input(&keystrokes("ctrl-k a"), &[]).1);
+        assert!(!keymap.bindings_for_input(&keystrokes("ctrl-k a b"), &[]).1);
+    }
+
+    #[test]
+    fn test_possible_next_bindings_use_typed_input() {
+        // Option-S reports both its physical key and the character it produced, so typed input
+        // matches bindings written with either.
+        let typed_input = [Keystroke::parse("alt-s->ß").unwrap()];
+
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ß a b", ActionAlpha {}, None),
+            KeyBinding::new("ß a", ActionBeta {}, None),
+            // Keeps the typed `alt-s a` pending, so `ß a b` stays typeable.
+            KeyBinding::new("alt-s a c", ActionGamma {}, None),
+        ]);
+        assert_eq!(
+            describe_bindings(&keymap.possible_next_bindings_for_input(&typed_input, &[])),
+            vec![
+                ("alt-s a c".to_string(), "test_only::ActionGamma"),
+                ("ß a".to_string(), "test_only::ActionBeta"),
+                ("ß a b".to_string(), "test_only::ActionAlpha"),
+            ]
+        );
+    }
+
+    fn describe_bindings(bindings: &[KeyBinding]) -> Vec<(String, &'static str)> {
+        bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.inner().unparse())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    binding.action().name(),
+                )
+            })
+            .collect()
+    }
+
+    fn keystrokes(source: &str) -> Vec<Keystroke> {
+        source
+            .split(' ')
+            .map(|keystroke| Keystroke::parse(keystroke).unwrap())
+            .collect()
     }
 }
